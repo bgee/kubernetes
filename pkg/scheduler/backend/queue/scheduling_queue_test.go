@@ -10221,6 +10221,68 @@ func TestPreQueueingHint_CompositePodGroupPreCheck(t *testing.T) {
 	}
 }
 
+// TestPreQueueingHint_PodUpdateHerdWithoutNarrowing measures the "herd": with
+// PreQueueingHint narrowing OFF, a single pod-status-update event is evaluated
+// against every DRA-rejected pod. The UID guard in isSchedulableAfterTargetPodUpdate
+// returns QueueSkip for every pod other than the one whose status changed; this
+// test counts those skips (expect N-1 for N pods) — i.e. the spurious requeues the
+// guard prevents. It uses a faithful stand-in for that guard, since the real
+// (unexported) function can't be registered from this package.
+func TestPreQueueingHint_PodUpdateHerdWithoutNarrowing(t *testing.T) {
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.SchedulerPreQueueingHints: false, // narrowing OFF: evaluate all pods
+	})
+	logger, ctx := ktesting.NewTestContext(t)
+
+	const n = 5
+	mismatches := 0
+	// Stand-in for isSchedulableAfterTargetPodUpdate's UID guard: the event carries
+	// the modified pod in newObj and only concerns that pod.
+	hintFn := func(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (fwk.QueueingHint, error) {
+		modified, ok := newObj.(*v1.Pod)
+		if !ok {
+			return fwk.Queue, nil
+		}
+		if pod.UID != modified.UID {
+			mismatches++
+			return fwk.QueueSkip, nil
+		}
+		return fwk.Queue, nil
+	}
+
+	podUpdate := fwk.ClusterEvent{Resource: fwk.TargetPod, ActionType: fwk.UpdatePodGeneratedResourceClaim}
+	m := makeEmptyQueueingHintMapPerProfile()
+	m[""][podUpdate] = []*QueueingHintFunction{
+		{PluginName: "testPlugin", QueueingHintFn: hintFn},
+	}
+	q := NewTestQueue(ctx, newDefaultQueueSort(), WithQueueingHintMapPerProfile(m))
+
+	pods := make([]*v1.Pod, n)
+	for i := 0; i < n; i++ {
+		pod := st.MakePod().Name(fmt.Sprintf("pod%d", i)).Namespace("ns1").UID(fmt.Sprintf("uid%d", i)).Obj()
+		pods[i] = pod
+		q.Add(ctx, pod)
+		entity, err := q.Pop(logger)
+		if err != nil {
+			t.Fatalf("Pop failed: %v", err)
+		}
+		pInfo := entity.(*framework.QueuedPodInfo)
+		pInfo.UnschedulablePlugins = sets.New[string]("testPlugin")
+		if err := q.AddUnschedulablePodIfNotPresent(logger, pInfo, q.SchedulingCycle()); err != nil {
+			t.Fatalf("AddUnschedulablePodIfNotPresent failed: %v", err)
+		}
+	}
+
+	// One pod (pods[0]) gets its generated-claim status populated.
+	q.MoveAllToActiveOrBackoffQueue(logger, podUpdate, nil, pods[0], nil)
+
+	// Without the guard, all N would be requeued on this single event; the guard
+	// skips the N-1 that the event isn't about.
+	if mismatches != n-1 {
+		t.Errorf("expected %d spurious (guarded) evaluations, got %d", n-1, mismatches)
+	}
+}
+
 func TestPreQueueingHint_WildcardSkipsNarrowing(t *testing.T) {
 	// When a wildcard event fires, PreQueueingHint narrowing is skipped
 	// and all pods are evaluated.

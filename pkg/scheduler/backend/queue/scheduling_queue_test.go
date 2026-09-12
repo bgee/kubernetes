@@ -10727,6 +10727,93 @@ func TestPreQueueingHint_NilObjects(t *testing.T) {
 	q.MoveAllToActiveOrBackoffQueue(logger, nodeAdd, nil, nil, nil)
 }
 
+// TestPreQueueingHint_PodUpdateHerdWithoutNarrowing measures the "herd": with
+// PreQueueingHint narrowing OFF, a single pod-status-update event is evaluated
+// against every DRA-rejected pod. A UID guard in the pod-update QueueingHintFn
+// (isSchedulableAfterTargetPodUpdate) returns QueueSkip for every pod other than
+// the one whose status changed; this counts those skips (N-1 for N pods) — i.e.
+// the spurious requeues the guard prevents. A faithful stand-in for that guard is
+// used here, since the real (unexported) function can't be registered.
+// TestPreQueueingHint_PodUpdateHerdViaInFlightReplay measures the realistic "herd"
+// for a pod-status update. A pod's own update flows through q.Update() (not a
+// MoveAll broadcast); while that pod is in-flight, the UpdatePodGeneratedResourceClaim
+// event is recorded and later replayed against every OTHER pod that was in-flight at
+// the same time, when those pods return via AddUnschedulablePodIfNotPresent. That
+// replay evaluates isSchedulableAfterTargetPodUpdate against a different pod, where
+// the UID guard returns QueueSkip. This counts those guarded (spurious) replays —
+// bounded by in-flight overlap, not the whole unschedulable pool. A faithful
+// stand-in for the guard is used, since the real (unexported) function can't be
+// registered.
+func TestPreQueueingHint_PodUpdateHerdViaInFlightReplay(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SchedulerPreQueueingHints, false)
+	logger, ctx := ktesting.NewTestContext(t)
+
+	mismatches := 0
+	// Stand-in for the pod-update guard: the event carries the updated pod in newObj
+	// and only concerns that pod.
+	hintFn := func(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (fwk.QueueingHint, error) {
+		modified, ok := newObj.(*v1.Pod)
+		if !ok {
+			return fwk.Queue, nil
+		}
+		if pod.UID != modified.UID {
+			mismatches++
+			return fwk.QueueSkip, nil
+		}
+		return fwk.Queue, nil
+	}
+
+	podUpdate := fwk.ClusterEvent{Resource: fwk.TargetPod, ActionType: fwk.UpdatePodGeneratedResourceClaim}
+	m := makeEmptyQueueingHintMapPerProfile()
+	m[""][podUpdate] = []*QueueingHintFunction{
+		{PluginName: "testPlugin", QueueingHintFn: hintFn},
+	}
+	q := NewTestQueue(ctx, newDefaultQueueSort(), WithQueueingHintMapPerProfile(m))
+
+	// Put some pods in-flight (Add then Pop, not Done'd). podA is one of them and
+	// is the pod whose status will change; the others overlap with that update.
+	const others = 3
+	inflight := make([]*framework.QueuedPodInfo, 0, others+1)
+	for i := 0; i < others; i++ {
+		pod := st.MakePod().Name(fmt.Sprintf("other%d", i)).Namespace("ns1").UID(fmt.Sprintf("other%d", i)).Obj()
+		q.Add(ctx, pod)
+		entity, err := q.Pop(logger)
+		if err != nil {
+			t.Fatalf("Pop failed: %v", err)
+		}
+		inflight = append(inflight, entity.(*framework.QueuedPodInfo))
+	}
+	oldA := st.MakePod().Name("podA").Namespace("ns1").UID("uidA").Obj()
+	q.Add(ctx, oldA)
+	entityA, err := q.Pop(logger)
+	if err != nil {
+		t.Fatalf("Pop failed: %v", err)
+	}
+	inflight = append(inflight, entityA.(*framework.QueuedPodInfo))
+
+	// podA's generated-claim status is populated while it is in-flight: Update
+	// records the UpdatePodGeneratedResourceClaim event for the in-flight pods.
+	claimName := "podA-claim"
+	newA := oldA.DeepCopy()
+	newA.Status.ResourceClaimStatuses = []v1.PodResourceClaimStatus{{Name: "claim", ResourceClaimName: &claimName}}
+	q.Update(ctx, oldA, newA)
+
+	// Each in-flight pod returns; the recorded event replays against it.
+	for _, pInfo := range inflight {
+		pInfo.UnschedulablePlugins = sets.New[string]("testPlugin")
+		if err := q.AddUnschedulablePodIfNotPresent(logger, pInfo, q.SchedulingCycle()); err != nil {
+			t.Fatalf("AddUnschedulablePodIfNotPresent failed: %v", err)
+		}
+	}
+
+	// The guard fires once for each of the `others` in-flight pods (the event isn't
+	// about them); podA itself matches and is not skipped. So the herd is bounded by
+	// in-flight overlap, not the unschedulable pool size.
+	if mismatches != others {
+		t.Errorf("expected %d guarded (spurious) in-flight replays, got %d", others, mismatches)
+	}
+}
+
 func TestPreQueueingHint_ErrorFallback(t *testing.T) {
 	// Verify that when PreQueueingHintFn returns an error, all pods are evaluated
 	// (fallback to AllPods behavior).

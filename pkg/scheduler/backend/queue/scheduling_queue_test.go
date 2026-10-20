@@ -10841,9 +10841,9 @@ func TestPreQueueingHint_ErrorFallback(t *testing.T) {
 	}
 }
 
-// newPodGroupQueueInUnschedulable returns a queue holding one unschedulable
-// PodGroup with members pgpod1 and pgpod2, rejected by testPlugin.
-func newPodGroupQueueInUnschedulable(t *testing.T, ctx context.Context, hint fwk.PreQueueingHintFn) (*PriorityQueue, *framework.QueuedPodGroupInfo) {
+// setupQueueForPodGroup returns a queue holding one unschedulable PodGroup with
+// members pgpod1 and pgpod2, rejected by testPlugin.
+func setupQueueForPodGroup(t *testing.T, ctx context.Context, hint fwk.PreQueueingHintFn) *PriorityQueue {
 	t.Helper()
 	pgName := "test-pg"
 	pod1 := st.MakePod().Name("pgpod1").Namespace("ns1").UID("pgpod1").PodGroupName(pgName).Obj()
@@ -10866,16 +10866,11 @@ func newPodGroupQueueInUnschedulable(t *testing.T, ctx context.Context, hint fwk
 		t.Fatal("pod group not found in unschedulable entities")
 	}
 	entity.(*framework.QueuedPodGroupInfo).UnschedulablePlugins = sets.New[string]("testPlugin")
-	return q, lookup
+	return q
 }
 
-// TestPreQueueingHint_GroupPreCheck verifies that in the narrowed path preCheck
-// sees every member of the group a hinted pod resolves to, including members of
-// other leaf PodGroups under the same CompositePodGroup root. The hint names one
-// member; preCheck rejects the group if it contains rejectUID. An unrelated
-// unschedulable pod checks that the narrowed path ran: the all-pods path would
-// collect it. The all-pods path is then run with the same preCheck, and must
-// reach the same decision about the group.
+// TestPreQueueingHint_GroupPreCheck verifies that preCheck sees every member of the
+// group a hinted pod resolves to, on both the narrowed and the all-pods path.
 func TestPreQueueingHint_GroupPreCheck(t *testing.T) {
 	podGroupGates := featuregatetesting.FeatureOverrides{
 		features.SchedulerPreQueueingHints: true,
@@ -10887,61 +10882,121 @@ func TestPreQueueingHint_GroupPreCheck(t *testing.T) {
 		features.CompositePodGroup:               true,
 		features.TopologyAwareWorkloadScheduling: true,
 	}
+	hinted := func(name string) fwk.PreQueueingHintResult {
+		return fwk.PreQueueingHintResult{Pods: []types.NamespacedName{{Name: name, Namespace: "ns1"}}}
+	}
+	allPods := fwk.PreQueueingHintResult{AllPods: true}
+	narrowedTo := func(name string) *preQueueingHintPodKeys {
+		nn := types.NamespacedName{Name: name, Namespace: "ns1"}
+		return &preQueueingHintPodKeys{
+			candidatePods: sets.New(nn),
+			perPlugin:     map[string]sets.Set[types.NamespacedName]{"testPlugin": sets.New(nn)},
+		}
+	}
+	allPodsKeys := &preQueueingHintPodKeys{
+		perPlugin:       map[string]sets.Set[types.NamespacedName]{},
+		evaluateAllPods: true,
+	}
+	podGroupKey := queuedEntityKeyFunc(newQueuedPodGroupInfoForLookup("ns1", "test-pg", fwk.PodGroupKeyType))
+	cpgKey := queuedEntityKeyFunc(newQueuedPodGroupInfoForLookup("ns1", "root-cpg", fwk.CompositePodGroupKeyType))
+	other := st.MakePod().Name("other").Namespace("ns1").UID("other").Obj()
+	otherKey := queuedEntityKeyFunc(newQueuedPodInfoForLookup(other))
+
 	tests := []struct {
-		name          string
-		gates         featuregatetesting.FeatureOverrides
-		newQueue      func(*testing.T, context.Context, fwk.PreQueueingHintFn) (*PriorityQueue, *framework.QueuedPodGroupInfo)
-		hinted        string
-		rejectUID     types.UID
-		wantCollected bool
+		name         string
+		gates        featuregatetesting.FeatureOverrides
+		setupQueue   func(*testing.T, context.Context, fwk.PreQueueingHintFn) *PriorityQueue
+		hint         fwk.PreQueueingHintResult
+		rejectUID    types.UID
+		wantHintKeys *preQueueingHintPodKeys
+		wantEntities []string
 	}{
 		{
-			name:          "PodGroup: preCheck rejects a member that was not hinted",
-			gates:         podGroupGates,
-			newQueue:      newPodGroupQueueInUnschedulable,
-			hinted:        "pgpod1",
-			rejectUID:     "pgpod2",
-			wantCollected: false,
+			name:         "PodGroup, narrowed: preCheck rejects a member that was not hinted",
+			gates:        podGroupGates,
+			setupQueue:   setupQueueForPodGroup,
+			hint:         hinted("pgpod1"),
+			rejectUID:    "pgpod2",
+			wantHintKeys: narrowedTo("pgpod1"),
 		},
 		{
-			name:          "PodGroup: preCheck accepts",
-			gates:         podGroupGates,
-			newQueue:      newPodGroupQueueInUnschedulable,
-			hinted:        "pgpod1",
-			rejectUID:     "nobody",
-			wantCollected: true,
+			name:         "PodGroup, narrowed: preCheck accepts",
+			gates:        podGroupGates,
+			setupQueue:   setupQueueForPodGroup,
+			hint:         hinted("pgpod1"),
+			rejectUID:    "nobody",
+			wantHintKeys: narrowedTo("pgpod1"),
+			wantEntities: []string{podGroupKey},
 		},
 		{
-			name:          "CompositePodGroup: preCheck rejects a member that was not hinted",
-			gates:         compositePodGroupGates,
-			newQueue:      newCPGQueueInUnschedulable,
-			hinted:        "cpgpod1",
-			rejectUID:     "cpgpod2",
-			wantCollected: false,
+			name:         "PodGroup, all pods: preCheck rejects a member",
+			gates:        podGroupGates,
+			setupQueue:   setupQueueForPodGroup,
+			hint:         allPods,
+			rejectUID:    "pgpod2",
+			wantHintKeys: allPodsKeys,
+			wantEntities: []string{otherKey},
 		},
 		{
-			name:          "CompositePodGroup: preCheck accepts",
-			gates:         compositePodGroupGates,
-			newQueue:      newCPGQueueInUnschedulable,
-			hinted:        "cpgpod1",
-			rejectUID:     "nobody",
-			wantCollected: true,
+			name:         "PodGroup, all pods: preCheck accepts",
+			gates:        podGroupGates,
+			setupQueue:   setupQueueForPodGroup,
+			hint:         allPods,
+			rejectUID:    "nobody",
+			wantHintKeys: allPodsKeys,
+			wantEntities: []string{podGroupKey, otherKey},
 		},
 		{
-			name:          "CompositePodGroup: preCheck rejects a member of another leaf PodGroup",
-			gates:         compositePodGroupGates,
-			newQueue:      newCPGQueueInUnschedulable,
-			hinted:        "cpgpod1",
-			rejectUID:     "cpgpod3",
-			wantCollected: false,
+			name:         "CompositePodGroup, narrowed: preCheck rejects a member that was not hinted",
+			gates:        compositePodGroupGates,
+			setupQueue:   setupQueueForCPG,
+			hint:         hinted("cpgpod1"),
+			rejectUID:    "cpgpod2",
+			wantHintKeys: narrowedTo("cpgpod1"),
 		},
 		{
-			name:          "CompositePodGroup: preCheck accepts, hinted pod in another leaf PodGroup",
-			gates:         compositePodGroupGates,
-			newQueue:      newCPGQueueInUnschedulable,
-			hinted:        "cpgpod3",
-			rejectUID:     "nobody",
-			wantCollected: true,
+			name:         "CompositePodGroup, narrowed: preCheck rejects a member of another leaf PodGroup",
+			gates:        compositePodGroupGates,
+			setupQueue:   setupQueueForCPG,
+			hint:         hinted("cpgpod1"),
+			rejectUID:    "cpgpod3",
+			wantHintKeys: narrowedTo("cpgpod1"),
+		},
+		{
+			name:         "CompositePodGroup, narrowed: preCheck accepts",
+			gates:        compositePodGroupGates,
+			setupQueue:   setupQueueForCPG,
+			hint:         hinted("cpgpod1"),
+			rejectUID:    "nobody",
+			wantHintKeys: narrowedTo("cpgpod1"),
+			wantEntities: []string{cpgKey},
+		},
+		{
+			name:         "CompositePodGroup, narrowed: preCheck accepts, hinted pod in another leaf PodGroup",
+			gates:        compositePodGroupGates,
+			setupQueue:   setupQueueForCPG,
+			hint:         hinted("cpgpod3"),
+			rejectUID:    "nobody",
+			wantHintKeys: narrowedTo("cpgpod3"),
+			wantEntities: []string{cpgKey},
+		},
+		{
+			name:         "CompositePodGroup, all pods: preCheck rejects a member of leaf pg2",
+			gates:        compositePodGroupGates,
+			setupQueue:   setupQueueForCPG,
+			hint:         allPods,
+			rejectUID:    "cpgpod3",
+			wantHintKeys: allPodsKeys,
+			wantEntities: []string{otherKey},
+		},
+		{
+			name:         "CompositePodGroup, all pods: preCheck accepts",
+			gates:        compositePodGroupGates,
+			setupQueue:   setupQueueForCPG,
+			hint:         allPods,
+			rejectUID:    "nobody",
+			wantHintKeys: allPodsKeys,
+			wantEntities: []string{cpgKey, otherKey},
 		},
 	}
 	for _, tt := range tests {
@@ -10951,17 +11006,13 @@ func TestPreQueueingHint_GroupPreCheck(t *testing.T) {
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
 
-			allPods := false
 			hint := func(_ klog.Logger, _, _ interface{}) (fwk.PreQueueingHintResult, error) {
-				if allPods {
-					return fwk.PreQueueingHintResult{AllPods: true}, nil
-				}
-				return fwk.PreQueueingHintResult{Pods: []types.NamespacedName{{Name: tt.hinted, Namespace: "ns1"}}}, nil
+				return tt.hint, nil
 			}
-			q, lookup := tt.newQueue(t, ctx, hint)
+			q := tt.setupQueue(t, ctx, hint)
 
-			other := st.MakePod().Name("other").Namespace("ns1").UID("other").Obj()
-			q.Add(ctx, other)
+			// An unschedulable pod that only the all-pods path collects.
+			q.Add(ctx, other.DeepCopy())
 			entity, err := q.Pop(logger)
 			if err != nil {
 				t.Fatalf("Pop failed: %v", err)
@@ -10984,41 +11035,19 @@ func TestPreQueueingHint_GroupPreCheck(t *testing.T) {
 				}
 				return true
 			}
-			// Keys are sorted because the all-pods path iterates a map.
-			collect := func() ([]string, *preQueueingHintPodKeys) {
-				q.lock.Lock()
-				defer q.lock.Unlock()
-				entities, hintKeys := q.collectEntitiesToEvaluate(logger, nodeAdd, nil, st.MakeNode().Name("node1").Obj(), preCheck)
-				keys := []string{}
-				for _, e := range entities {
-					keys = append(keys, queuedEntityKeyFunc(e))
-				}
-				slices.Sort(keys)
-				return keys, hintKeys
-			}
-			want := []string{}
-			if tt.wantCollected {
-				want = append(want, queuedEntityKeyFunc(lookup))
-			}
+			q.lock.Lock()
+			entities, hintKeys := q.collectEntitiesToEvaluate(logger, nodeAdd, nil, st.MakeNode().Name("node1").Obj(), preCheck)
+			q.lock.Unlock()
 
-			got, hintKeys := collect()
-			if hintKeys == nil || hintKeys.evaluateAllPods {
-				t.Fatalf("expected the narrowed path, got hintKeys %+v", hintKeys)
+			if diff := cmp.Diff(tt.wantHintKeys, hintKeys, cmp.AllowUnexported(preQueueingHintPodKeys{})); diff != "" {
+				t.Errorf("hint keys (-want +got):\n%s", diff)
 			}
-			if diff := cmp.Diff(want, got); diff != "" {
-				t.Errorf("narrowed path: collected entities (-want +got):\n%s", diff)
+			var got []string
+			for _, e := range entities {
+				got = append(got, queuedEntityKeyFunc(e))
 			}
-
-			// Narrowing must not change the decision about the group.
-			allPods = true
-			got, hintKeys = collect()
-			if hintKeys == nil || !hintKeys.evaluateAllPods {
-				t.Fatalf("expected the all-pods path, got hintKeys %+v", hintKeys)
-			}
-			want = append(want, queuedEntityKeyFunc(otherPInfo))
-			slices.Sort(want)
-			if diff := cmp.Diff(want, got); diff != "" {
-				t.Errorf("all-pods path: collected entities (-want +got):\n%s", diff)
+			if diff := cmp.Diff(tt.wantEntities, got, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+				t.Errorf("collected entities (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -11100,11 +11129,11 @@ func TestPreQueueingHint_CompositePodGroupLookup(t *testing.T) {
 	}
 }
 
-// newCPGQueueInUnschedulable builds a queue with a root CompositePodGroup (root-cpg)
+// setupQueueForCPG builds a queue with a root CompositePodGroup (root-cpg)
 // with two leaf PodGroups, pg1 (cpgpod1, cpgpod2) and pg2 (cpgpod3), moves the root
 // CPG entity into the unschedulable pool (rejected by "testPlugin"), and returns the
-// queue and the root CPG lookup.
-func newCPGQueueInUnschedulable(t *testing.T, ctx context.Context, hint fwk.PreQueueingHintFn) (*PriorityQueue, *framework.QueuedPodGroupInfo) {
+// queue.
+func setupQueueForCPG(t *testing.T, ctx context.Context, hint fwk.PreQueueingHintFn) *PriorityQueue {
 	t.Helper()
 	logger := klog.FromContext(ctx)
 	cpgName := "root-cpg"
@@ -11135,7 +11164,7 @@ func newCPGQueueInUnschedulable(t *testing.T, ctx context.Context, hint fwk.PreQ
 	}
 	entity.(*framework.QueuedPodGroupInfo).UnschedulablePlugins = sets.New[string]("testPlugin")
 	q.unschedulableEntities.addOrUpdate(entity, false, framework.EventUnscheduledPodAdd.Label(), nil)
-	return q, lookup
+	return q
 }
 
 // TestPreQueueingHint_CompositePodGroupDedup verifies that when several hinted pods
@@ -11156,7 +11185,7 @@ func TestPreQueueingHint_CompositePodGroupDedup(t *testing.T) {
 			{Name: "cpgpod1", Namespace: "ns1"}, {Name: "cpgpod2", Namespace: "ns1"},
 		}}, nil
 	}
-	q, _ := newCPGQueueInUnschedulable(t, ctx, hint)
+	q := setupQueueForCPG(t, ctx, hint)
 
 	q.lock.Lock()
 	entities, _ := q.collectEntitiesToEvaluate(logger, nodeAdd, nil, st.MakeNode().Name("node1").Obj(), nil)

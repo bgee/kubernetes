@@ -2170,6 +2170,9 @@ func (p *PriorityQueue) runPreQueueingHintPlugins(logger klog.Logger, event fwk.
 	result := &preQueueingHintPodKeys{
 		perPlugin: make(map[string]sets.Set[types.NamespacedName]),
 	}
+	// A plugin can register several events that match this one. If any of them
+	// needs all pods, none of that plugin's hints may be narrowed.
+	allPodsPlugins := sets.New[string]()
 	for _, hintMap := range p.queueingHintMap {
 		for eventToMatch, hintfns := range hintMap {
 			if !framework.MatchClusterEvents(eventToMatch, event) {
@@ -2180,6 +2183,7 @@ func (p *PriorityQueue) runPreQueueingHintPlugins(logger klog.Logger, event fwk.
 					// If current plugin doesn't register PreQueueingHints, we will treat it as AllPods
 					p.metricsRecorder.ObserveCounterAsync(metrics.PreQueueingHintEvaluations, 1, hintfn.PluginName, metrics.PreQueueingHintResultNoPreQFn)
 					result.evaluateAllPods = true
+					allPodsPlugins.Insert(hintfn.PluginName)
 					continue
 				}
 				hintResult, err := hintfn.PreQueueingHintFn(logger, oldObj, newObj)
@@ -2189,6 +2193,7 @@ func (p *PriorityQueue) runPreQueueingHintPlugins(logger klog.Logger, event fwk.
 					utilruntime.HandleErrorWithLogger(logger, err, "PreQueueingHintFn failed, falling back to evaluate all pods", "plugin", hintfn.PluginName)
 					p.metricsRecorder.ObserveCounterAsync(metrics.PreQueueingHintEvaluations, 1, hintfn.PluginName, metrics.PreQueueingHintResultPreQFnError)
 					result.evaluateAllPods = true
+					allPodsPlugins.Insert(hintfn.PluginName)
 					continue
 				}
 				if hintResult.AllPods {
@@ -2196,6 +2201,7 @@ func (p *PriorityQueue) runPreQueueingHintPlugins(logger klog.Logger, event fwk.
 					// Same here, we still continue to evaluate other plugins' PreQHints.
 					p.metricsRecorder.ObserveCounterAsync(metrics.PreQueueingHintEvaluations, 1, hintfn.PluginName, metrics.PreQueueingHintResultAllPods)
 					result.evaluateAllPods = true
+					allPodsPlugins.Insert(hintfn.PluginName)
 					continue
 				}
 				p.metricsRecorder.ObserveCounterAsync(metrics.PreQueueingHintEvaluations, 1, hintfn.PluginName, metrics.PreQueueingHintResultNarrowed)
@@ -2212,6 +2218,9 @@ func (p *PriorityQueue) runPreQueueingHintPlugins(logger klog.Logger, event fwk.
 				}
 			}
 		}
+	}
+	for name := range allPodsPlugins {
+		delete(result.perPlugin, name)
 	}
 	if result.candidatePods == nil && !result.evaluateAllPods {
 		return nil

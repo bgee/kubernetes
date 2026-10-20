@@ -11511,6 +11511,76 @@ func TestPreQueueingHint_AllPodsAndErrorPreserveNarrowing(t *testing.T) {
 	}
 }
 
+// TestPreQueueingHint_SamePluginMixedRegistrations verifies that a plugin is not
+// narrowed when another of its registrations matching the event, in the same or
+// another profile, needs all pods.
+func TestPreQueueingHint_SamePluginMixedRegistrations(t *testing.T) {
+	narrow := func(_ klog.Logger, _, _ interface{}) (fwk.PreQueueingHintResult, error) {
+		return fwk.PreQueueingHintResult{Pods: []types.NamespacedName{{Name: "pod1", Namespace: "ns1"}}}, nil
+	}
+	allPods := func(_ klog.Logger, _, _ interface{}) (fwk.PreQueueingHintResult, error) {
+		return fwk.PreQueueingHintResult{AllPods: true}, nil
+	}
+	fail := func(_ klog.Logger, _, _ interface{}) (fwk.PreQueueingHintResult, error) {
+		return fwk.PreQueueingHintResult{}, fmt.Errorf("injected error")
+	}
+	tests := []struct {
+		name         string
+		other        fwk.PreQueueingHintFn
+		otherProfile string
+	}{
+		{name: "no PreQueueingHintFn", other: nil},
+		{name: "AllPods", other: allPods},
+		{name: "error", other: fail},
+		{name: "no PreQueueingHintFn in another profile", other: nil, otherProfile: "profile2"},
+		{name: "AllPods in another profile", other: allPods, otherProfile: "profile2"},
+		{name: "error in another profile", other: fail, otherProfile: "profile2"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SchedulerPreQueueingHints, true)
+			logger, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			m := makeEmptyQueueingHintMapPerProfile()
+			m[""][nodeAdd] = []*QueueingHintFunction{
+				{PluginName: "testPlugin", QueueingHintFn: queueHintReturnSkip, PreQueueingHintFn: narrow},
+			}
+			if _, ok := m[tt.otherProfile]; !ok {
+				m[tt.otherProfile] = make(QueueingHintMap)
+			}
+			m[tt.otherProfile][nodeAdd] = append(m[tt.otherProfile][nodeAdd],
+				&QueueingHintFunction{PluginName: "testPlugin", QueueingHintFn: queueHintReturnQueue, PreQueueingHintFn: tt.other})
+			q := NewTestQueue(ctx, newDefaultQueueSort(), WithQueueingHintMapPerProfile(m))
+
+			pod1 := st.MakePod().Name("pod1").Namespace("ns1").UID("pod1").Obj()
+			pod2 := st.MakePod().Name("pod2").Namespace("ns1").UID("pod2").SchedulerName(tt.otherProfile).Obj()
+			for _, pod := range []*v1.Pod{pod1, pod2} {
+				q.Add(ctx, pod)
+				entity, err := q.Pop(logger)
+				if err != nil {
+					t.Fatalf("Pop failed: %v", err)
+				}
+				pInfo := entity.(*framework.QueuedPodInfo)
+				pInfo.UnschedulablePlugins = sets.New[string]("testPlugin")
+				if err := q.AddUnschedulablePodIfNotPresent(ctx, pInfo, q.SchedulingCycle()); err != nil {
+					t.Fatalf("AddUnschedulablePodIfNotPresent failed: %v", err)
+				}
+			}
+
+			q.MoveAllToActiveOrBackoffQueue(logger, nodeAdd, nil, st.MakeNode().Name("node1").Obj(), nil)
+
+			// pod2 was not hinted, so only the all-pods registration, which returns Queue, can requeue it.
+			for _, p := range q.UnschedulablePods() {
+				if p.Name == "pod2" {
+					t.Errorf("expected pod2 to be requeued by the all-pods registration")
+				}
+			}
+		})
+	}
+}
+
 // TestPreQueueingHint_MultiProfileNarrowing verifies that PreQueueingHint runs
 // across all scheduler profiles: a pod in one profile must not be dropped
 // because narrowing was computed from another profile's hints.

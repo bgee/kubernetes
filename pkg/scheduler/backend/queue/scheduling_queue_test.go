@@ -10142,6 +10142,44 @@ func findPodGroupInfoInActiveQ(q *PriorityQueue, namespace, name string, entityT
 	return nil
 }
 
+// putEntityToUnschedulable moves the entity matching lookup from activeQ into the
+// unschedulable pool, as if plugins rejected it.
+func putEntityToUnschedulable(t *testing.T, q *PriorityQueue, lookup framework.QueuedEntityInfo, plugins ...string) {
+	t.Helper()
+	entity := q.activeQ.delete(lookup)
+	if entity == nil {
+		t.Fatalf("%s/%s not found in activeQ", lookup.GetNamespace(), lookup.GetName())
+	}
+	switch e := entity.(type) {
+	case *framework.QueuedPodInfo:
+		e.UnschedulablePlugins = sets.New(plugins...)
+	case *framework.QueuedPodGroupInfo:
+		e.UnschedulablePlugins = sets.New(plugins...)
+	default:
+		t.Fatalf("unexpected entity type %T", entity)
+	}
+	q.unschedulableEntities.addOrUpdate(entity, false, framework.EventUnscheduledPodAdd.Label(), nil)
+}
+
+// putPodToUnschedulable adds pod to q, pops it, and returns it to the unschedulable
+// pool as if plugins rejected it in that scheduling attempt.
+func putPodToUnschedulable(t *testing.T, ctx context.Context, q *PriorityQueue, pod *v1.Pod, plugins ...string) {
+	t.Helper()
+	q.Add(ctx, pod)
+	entity, err := q.Pop(klog.FromContext(ctx))
+	if err != nil {
+		t.Fatalf("Pop failed: %v", err)
+	}
+	pInfo, ok := entity.(*framework.QueuedPodInfo)
+	if !ok || pInfo.Pod.UID != pod.UID {
+		t.Fatalf("expected to pop pod %s, got %v", klog.KObj(pod), entity)
+	}
+	pInfo.UnschedulablePlugins = sets.New(plugins...)
+	if err := q.AddUnschedulablePodIfNotPresent(ctx, pInfo, q.SchedulingCycle()); err != nil {
+		t.Fatalf("AddUnschedulablePodIfNotPresent failed: %v", err)
+	}
+}
+
 // newQueuedPodGroupInfoForLookup builds a QueuedPodGroupInfo object for a lookup in the queue.
 func newQueuedPodGroupInfoForLookup(namespace, name string, entityType fwk.EntityKeyType) *framework.QueuedPodGroupInfo {
 	if entityType == fwk.CompositePodGroupKeyType {
@@ -10445,16 +10483,7 @@ func TestPriorityQueue_PreQueueingHint(t *testing.T) {
 			q := NewTestQueue(ctx, newDefaultQueueSort(), WithQueueingHintMapPerProfile(m))
 
 			for _, pod := range tt.pods {
-				q.Add(ctx, pod)
-				entity, err := q.Pop(logger)
-				if err != nil {
-					t.Fatalf("Pop failed: %v", err)
-				}
-				pInfo := entity.(*framework.QueuedPodInfo)
-				pInfo.UnschedulablePlugins = sets.New[string]("foo", "bar")
-				if err := q.AddUnschedulablePodIfNotPresent(ctx, pInfo, q.SchedulingCycle()); err != nil {
-					t.Fatalf("AddUnschedulablePodIfNotPresent failed: %v", err)
-				}
+				putPodToUnschedulable(t, ctx, q, pod, "foo", "bar")
 			}
 
 			q.MoveAllToActiveOrBackoffQueue(logger, nodeAdd, nil, st.MakeNode().Name("node1").Obj(), nil)
@@ -10513,16 +10542,7 @@ func TestPreQueueingHint_FlushRescue(t *testing.T) {
 
 	// Add both pods to unschedulable (simulating failed scheduling)
 	for _, pod := range []*v1.Pod{pod1, pod2} {
-		q.Add(ctx, pod)
-		entity, err := q.Pop(logger)
-		if err != nil {
-			t.Fatalf("Pop failed: %v", err)
-		}
-		pInfo := entity.(*framework.QueuedPodInfo)
-		pInfo.UnschedulablePlugins = sets.New[string]("fakePlugin")
-		if err := q.AddUnschedulablePodIfNotPresent(ctx, pInfo, q.SchedulingCycle()); err != nil {
-			t.Fatalf("AddUnschedulablePodIfNotPresent failed: %v", err)
-		}
+		putPodToUnschedulable(t, ctx, q, pod, "fakePlugin")
 	}
 
 	// Trigger event - PreQueueingHint only identifies pod1
@@ -10607,13 +10627,7 @@ func TestPreQueueingHint_Metrics(t *testing.T) {
 	q := NewTestQueue(ctx, newDefaultQueueSort(), WithQueueingHintMapPerProfile(m), WithMetricsRecorder(recorder))
 
 	pod := st.MakePod().Name("pod1").Namespace("ns1").UID("1").Obj()
-	q.Add(ctx, pod)
-	entity, _ := q.Pop(logger)
-	pInfo := entity.(*framework.QueuedPodInfo)
-	pInfo.UnschedulablePlugins = sets.New[string]("testPlugin")
-	if err := q.AddUnschedulablePodIfNotPresent(ctx, pInfo, q.SchedulingCycle()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	putPodToUnschedulable(t, ctx, q, pod, "testPlugin")
 
 	q.MoveAllToActiveOrBackoffQueue(logger, nodeAdd, nil, st.MakeNode().Name("node1").Obj(), nil)
 
@@ -10736,12 +10750,7 @@ func TestPreQueueingHint_PodGroupLookup(t *testing.T) {
 
 	// Add standalone pod to unschedulable queue.
 	q.Add(ctx, pod3)
-	standaloneEntity := q.activeQ.delete(newQueuedPodInfoForLookup(pod3))
-	if standaloneEntity == nil {
-		t.Fatal("standalone pod not found in activeQ")
-	}
-	standaloneEntity.(*framework.QueuedPodInfo).UnschedulablePlugins = sets.New[string]("testPlugin")
-	q.unschedulableEntities.addOrUpdate(standaloneEntity, false, framework.EventUnscheduledPodAdd.Label(), nil)
+	putEntityToUnschedulable(t, q, newQueuedPodInfoForLookup(pod3), "testPlugin")
 
 	// Fire event — hint returns only pgpod1. The O(1) lookup should:
 	// 1. Not find "pod/ns1/pgpod1" (it's stored as a pod group)
@@ -10819,16 +10828,7 @@ func TestPreQueueingHint_ErrorFallback(t *testing.T) {
 
 	// Add both pods to unschedulable.
 	for _, pod := range []*v1.Pod{pod1, pod2} {
-		q.Add(ctx, pod)
-		entity, err := q.Pop(logger)
-		if err != nil {
-			t.Fatalf("Pop failed: %v", err)
-		}
-		pInfo := entity.(*framework.QueuedPodInfo)
-		pInfo.UnschedulablePlugins = sets.New[string]("fakePlugin")
-		if err := q.AddUnschedulablePodIfNotPresent(ctx, pInfo, q.SchedulingCycle()); err != nil {
-			t.Fatalf("AddUnschedulablePodIfNotPresent failed: %v", err)
-		}
+		putPodToUnschedulable(t, ctx, q, pod, "fakePlugin")
 	}
 
 	// Trigger event - PreQueueingHint returns error, so all pods should be evaluated.
@@ -11012,19 +11012,7 @@ func TestPreQueueingHint_GroupPreCheck(t *testing.T) {
 			q := tt.setupQueue(t, ctx, hint)
 
 			// An unschedulable pod that only the all-pods path collects.
-			q.Add(ctx, other.DeepCopy())
-			entity, err := q.Pop(logger)
-			if err != nil {
-				t.Fatalf("Pop failed: %v", err)
-			}
-			otherPInfo, ok := entity.(*framework.QueuedPodInfo)
-			if !ok || otherPInfo.Pod.Name != "other" {
-				t.Fatalf("expected to pop the unrelated pod, got %v", entity)
-			}
-			otherPInfo.UnschedulablePlugins = sets.New[string]("testPlugin")
-			if err := q.AddUnschedulablePodIfNotPresent(ctx, otherPInfo, q.SchedulingCycle()); err != nil {
-				t.Fatalf("AddUnschedulablePodIfNotPresent failed: %v", err)
-			}
+			putPodToUnschedulable(t, ctx, q, other.DeepCopy(), "testPlugin")
 
 			// Same shape as the scheduler's getDifferentUIDPreCheck.
 			preCheck := func(entity framework.QueuedEntityInfo) bool {
@@ -11099,24 +11087,10 @@ func TestPreQueueingHint_CompositePodGroupLookup(t *testing.T) {
 
 	// Move the root CPG entity into the unschedulable pool.
 	cpgLookup := newQueuedPodGroupInfoForLookup("ns1", cpgName, fwk.CompositePodGroupKeyType)
-	entity := q.activeQ.delete(cpgLookup)
-	if entity == nil {
-		t.Fatal("root CPG entity not found in activeQ")
-	}
-	entity.(*framework.QueuedPodGroupInfo).UnschedulablePlugins = sets.New[string]("testPlugin")
-	q.unschedulableEntities.addOrUpdate(entity, false, framework.EventUnscheduledPodAdd.Label(), nil)
+	putEntityToUnschedulable(t, q, cpgLookup, "testPlugin")
 
 	// Add an unrelated standalone pod to the unschedulable pool.
-	q.Add(ctx, other)
-	otherEntity, err := q.Pop(logger)
-	if err != nil {
-		t.Fatalf("Pop failed: %v", err)
-	}
-	otherPInfo := otherEntity.(*framework.QueuedPodInfo)
-	otherPInfo.UnschedulablePlugins = sets.New[string]("testPlugin")
-	if err := q.AddUnschedulablePodIfNotPresent(ctx, otherPInfo, q.SchedulingCycle()); err != nil {
-		t.Fatalf("AddUnschedulablePodIfNotPresent failed: %v", err)
-	}
+	putPodToUnschedulable(t, ctx, q, other, "testPlugin")
 
 	// Fire an event; the hint points at cpgpod1, which must resolve to the root CPG.
 	q.MoveAllToActiveOrBackoffQueue(logger, nodeAdd, nil, st.MakeNode().Name("node1").Obj(), nil)
@@ -11158,12 +11132,7 @@ func setupQueueForCPG(t *testing.T, ctx context.Context, hint fwk.PreQueueingHin
 	}
 
 	lookup := newQueuedPodGroupInfoForLookup("ns1", cpgName, fwk.CompositePodGroupKeyType)
-	entity := q.activeQ.delete(lookup)
-	if entity == nil {
-		t.Fatal("root CPG entity not found in activeQ")
-	}
-	entity.(*framework.QueuedPodGroupInfo).UnschedulablePlugins = sets.New[string]("testPlugin")
-	q.unschedulableEntities.addOrUpdate(entity, false, framework.EventUnscheduledPodAdd.Label(), nil)
+	putEntityToUnschedulable(t, q, lookup, "testPlugin")
 	return q
 }
 
@@ -11224,16 +11193,7 @@ func TestPreQueueingHint_WildcardSkipsNarrowing(t *testing.T) {
 	pod2 := st.MakePod().Name("pod2").Namespace("ns1").UID("2").Obj()
 
 	for _, pod := range []*v1.Pod{pod1, pod2} {
-		q.Add(ctx, pod)
-		entity, err := q.Pop(logger)
-		if err != nil {
-			t.Fatalf("Pop failed: %v", err)
-		}
-		pInfo := entity.(*framework.QueuedPodInfo)
-		pInfo.UnschedulablePlugins = sets.New[string]("testPlugin")
-		if err := q.AddUnschedulablePodIfNotPresent(ctx, pInfo, q.SchedulingCycle()); err != nil {
-			t.Fatalf("AddUnschedulablePodIfNotPresent failed: %v", err)
-		}
+		putPodToUnschedulable(t, ctx, q, pod, "testPlugin")
 	}
 
 	// Fire wildcard event — narrowing should be skipped, all pods evaluated.
@@ -11284,16 +11244,7 @@ func TestPreQueueingHint_PerPluginNarrowing(t *testing.T) {
 	pod2 := st.MakePod().Name("pod2").Namespace("ns1").UID("2").Obj()
 
 	for _, pod := range []*v1.Pod{pod1, pod2} {
-		q.Add(ctx, pod)
-		entity, err := q.Pop(logger)
-		if err != nil {
-			t.Fatalf("Pop failed: %v", err)
-		}
-		pInfo := entity.(*framework.QueuedPodInfo)
-		pInfo.UnschedulablePlugins = sets.New[string]("pluginA", "pluginB")
-		if err := q.AddUnschedulablePodIfNotPresent(ctx, pInfo, q.SchedulingCycle()); err != nil {
-			t.Fatalf("AddUnschedulablePodIfNotPresent failed: %v", err)
-		}
+		putPodToUnschedulable(t, ctx, q, pod, "pluginA", "pluginB")
 	}
 
 	q.MoveAllToActiveOrBackoffQueue(logger, nodeAdd, nil, st.MakeNode().Name("node1").Obj(), nil)
@@ -11363,16 +11314,7 @@ func TestPreQueueingHint_NonNarrowingPluginEvaluatesAllPods(t *testing.T) {
 	pod2 := st.MakePod().Name("pod2").Namespace("ns1").UID("2").Obj()
 
 	for _, pod := range []*v1.Pod{pod1, pod2} {
-		q.Add(ctx, pod)
-		entity, err := q.Pop(logger)
-		if err != nil {
-			t.Fatalf("Pop failed: %v", err)
-		}
-		pInfo := entity.(*framework.QueuedPodInfo)
-		pInfo.UnschedulablePlugins = sets.New[string]("narrowingPlugin", "nonNarrowingPlugin")
-		if err := q.AddUnschedulablePodIfNotPresent(ctx, pInfo, q.SchedulingCycle()); err != nil {
-			t.Fatalf("AddUnschedulablePodIfNotPresent failed: %v", err)
-		}
+		putPodToUnschedulable(t, ctx, q, pod, "narrowingPlugin", "nonNarrowingPlugin")
 	}
 
 	q.MoveAllToActiveOrBackoffQueue(logger, nodeAdd, nil, st.MakeNode().Name("node1").Obj(), nil)
@@ -11511,16 +11453,7 @@ func TestPreQueueingHint_AllPodsAndErrorPreserveNarrowing(t *testing.T) {
 			pod2 := st.MakePod().Name("pod2").Namespace("ns1").UID("2").Obj()
 
 			for _, pod := range []*v1.Pod{pod1, pod2} {
-				q.Add(ctx, pod)
-				entity, err := q.Pop(logger)
-				if err != nil {
-					t.Fatalf("Pop failed: %v", err)
-				}
-				pInfo := entity.(*framework.QueuedPodInfo)
-				pInfo.UnschedulablePlugins = sets.New[string]("narrowingPlugin", "pluginB")
-				if err := q.AddUnschedulablePodIfNotPresent(ctx, pInfo, q.SchedulingCycle()); err != nil {
-					t.Fatalf("AddUnschedulablePodIfNotPresent failed: %v", err)
-				}
+				putPodToUnschedulable(t, ctx, q, pod, "narrowingPlugin", "pluginB")
 			}
 
 			q.MoveAllToActiveOrBackoffQueue(logger, nodeAdd, nil, st.MakeNode().Name("node1").Obj(), nil)
@@ -11586,16 +11519,7 @@ func TestPreQueueingHint_SamePluginMixedRegistrations(t *testing.T) {
 			pod1 := st.MakePod().Name("pod1").Namespace("ns1").UID("pod1").Obj()
 			pod2 := st.MakePod().Name("pod2").Namespace("ns1").UID("pod2").SchedulerName(tt.otherProfile).Obj()
 			for _, pod := range []*v1.Pod{pod1, pod2} {
-				q.Add(ctx, pod)
-				entity, err := q.Pop(logger)
-				if err != nil {
-					t.Fatalf("Pop failed: %v", err)
-				}
-				pInfo := entity.(*framework.QueuedPodInfo)
-				pInfo.UnschedulablePlugins = sets.New[string]("testPlugin")
-				if err := q.AddUnschedulablePodIfNotPresent(ctx, pInfo, q.SchedulingCycle()); err != nil {
-					t.Fatalf("AddUnschedulablePodIfNotPresent failed: %v", err)
-				}
+				putPodToUnschedulable(t, ctx, q, pod, "testPlugin")
 			}
 
 			q.MoveAllToActiveOrBackoffQueue(logger, nodeAdd, nil, st.MakeNode().Name("node1").Obj(), nil)
@@ -11650,16 +11574,7 @@ func TestPreQueueingHint_MultiProfileNarrowing(t *testing.T) {
 	pod2 := st.MakePod().Name("pod2").Namespace("ns1").UID("2").SchedulerName("profile2").Obj()
 
 	for _, pod := range []*v1.Pod{pod1, pod2} {
-		q.Add(ctx, pod)
-		entity, err := q.Pop(logger)
-		if err != nil {
-			t.Fatalf("Pop failed: %v", err)
-		}
-		pInfo := entity.(*framework.QueuedPodInfo)
-		pInfo.UnschedulablePlugins = sets.New[string]("plugin")
-		if err := q.AddUnschedulablePodIfNotPresent(ctx, pInfo, q.SchedulingCycle()); err != nil {
-			t.Fatalf("AddUnschedulablePodIfNotPresent failed: %v", err)
-		}
+		putPodToUnschedulable(t, ctx, q, pod, "plugin")
 	}
 
 	q.MoveAllToActiveOrBackoffQueue(logger, nodeAdd, nil, st.MakeNode().Name("node1").Obj(), nil)
